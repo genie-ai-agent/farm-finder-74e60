@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Farm Finder — Local, Organic, In Season</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600;9..144,800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<section id="gate" class="gate">
+  <div class="gate-inner">
+    <p class="eyebrow">Farm Finder</p>
+    <h1 class="gate-title">Fresh. Local.<br/>In season.</h1>
+    <p class="gate-sub">Share your location to see farms near you and what they're growing this month.</p>
+    <button id="locate" class="btn">Use my location</button>
+    <p id="gate-status" class="gate-status"></p>
+    <button id="manual" class="link">Enter a place instead</button>
+    <form id="manual-form" class="manual-form" hidden>
+      <input id="manual-input" type="text" placeholder="City, ZIP, or address" autocomplete="off" />
+      <button type="submit" class="btn btn-sm">Search</button>
+    </form>
+  </div>
+</section>
+
+<main id="app" hidden>
+  <header class="top">
+    <div class="top-left">
+      <p class="eyebrow">Farm Finder</p>
+      <h2 id="place-name" class="place-name">—</h2>
+    </div>
+    <button id="reset" class="link">Change location</button>
+  </header>
+
+  <section class="season">
+    <p class="section-label">In season now</p>
+    <h3 id="month-name" class="month-name">—</h3>
+    <ul id="season-list" class="season-list"></ul>
+  </section>
+
+  <section class="farms">
+    <div class="farms-head">
+      <p class="section-label">Farms near you</p>
+      <p id="farm-count" class="count">—</p>
+    </div>
+    <ul id="farm-list" class="farm-list"></ul>
+    <p id="farm-empty" class="empty" hidden>No farms found in OpenStreetMap within 40 km. Try a different location.</p>
+  </section>
+
+  <footer class="foot">
+    <p>Data from OpenStreetMap contributors. Seasonal produce is a guide; call farms to confirm availability, pickup, and delivery.</p>
+  </footer>
+</main>
+
+<div id="loader" class="loader" hidden>
+  <div class="loader-dot"></div>
+  <p id="loader-text">Locating…</p>
+</div>
+
+<script src="seasons.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
