@@ -1,5 +1,6 @@
 // ===== Farm Finder =====
-// Flow: geolocate -> reverse geocode (Nominatim) -> query Overpass for farms -> render.
+// Flow: geolocate -> reverse geocode -> query Overpass for farms -> render.
+// Overpass is picky: keep the query small, try multiple radii, race endpoints.
 
 const $ = (id) => document.getElementById(id);
 
@@ -21,7 +22,7 @@ const loader = $('loader');
 const loaderText = $('loader-text');
 
 function showLoader(txt) {
-  loaderText.textContent = txt || 'Loading…';
+  loaderText.textContent = txt || 'Loading\u2026';
   loader.hidden = false;
 }
 function hideLoader() { loader.hidden = true; }
@@ -30,15 +31,16 @@ function hideLoader() { loader.hidden = true; }
 locateBtn.addEventListener('click', () => {
   if (!navigator.geolocation) {
     gateStatus.textContent = 'Geolocation not supported. Try entering a place instead.';
+    manualForm.hidden = false;
     return;
   }
-  gateStatus.textContent = 'Requesting location…';
+  gateStatus.textContent = 'Requesting location\u2026';
   navigator.geolocation.getCurrentPosition(
     (pos) => start(pos.coords.latitude, pos.coords.longitude),
     (err) => {
       gateStatus.textContent = err.code === 1
         ? 'Location blocked. Enter a place below.'
-        : 'Couldn\'t get your location. Enter a place below.';
+        : "Couldn't get your location. Enter a place below.";
       manualForm.hidden = false;
     },
     { enableHighAccuracy: false, timeout: 12000, maximumAge: 300000 }
@@ -54,12 +56,14 @@ manualForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const q = manualInput.value.trim();
   if (!q) return;
-  gateStatus.textContent = 'Looking up…';
+  gateStatus.textContent = 'Looking up\u2026';
   try {
-    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`);
+    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&limit=1&q=${encodeURIComponent(q)}`, {
+      headers: { 'Accept': 'application/json' }
+    });
     const data = await res.json();
     if (!data || !data.length) {
-      gateStatus.textContent = 'Couldn\'t find that place.';
+      gateStatus.textContent = "Couldn't find that place.";
       return;
     }
     start(parseFloat(data[0].lat), parseFloat(data[0].lon), data[0].display_name);
@@ -79,73 +83,127 @@ resetBtn.addEventListener('click', () => {
 
 // ---- main flow ----
 async function start(lat, lon, preLabel) {
-  showLoader('Finding farms near you…');
+  showLoader('Finding farms near you\u2026');
+  // Render place + season immediately so the UI is never empty while farms load.
+  const placeLabel = preLabel || await reverseGeocode(lat, lon).catch(() => `${lat.toFixed(2)}, ${lon.toFixed(2)}`);
+  renderPlace(placeLabel);
+  renderSeason(lat);
+  gate.style.display = 'none';
+  app.hidden = false;
+
+  // Try Overpass at 60km first. If it fails or returns nothing, fall back to
+  // our curated list of well-known farms and filter by distance.
+  loaderText.textContent = 'Searching within 60 km\u2026';
+  let farms = [];
+  let usedRadius = 60;
   try {
-    const [placeLabel, farms] = await Promise.all([
-      preLabel ? Promise.resolve(preLabel) : reverseGeocode(lat, lon),
-      fetchFarms(lat, lon)
-    ]);
-    renderPlace(placeLabel, lat);
-    renderSeason(lat);
-    renderFarms(farms, lat, lon);
-    gate.style.display = 'none';
-    app.hidden = false;
+    farms = await fetchFarms(lat, lon, 60000);
   } catch (e) {
-    console.error(e);
-    gateStatus.textContent = 'Something went wrong. Try again.';
-  } finally {
-    hideLoader();
+    console.error('overpass failed', e);
   }
+
+  if (farms.length < 3) {
+    loaderText.textContent = 'Expanding search\u2026';
+    // Merge fallback list within 150km, dedupe by name+coords.
+    const fb = pickFallback(lat, lon, 150);
+    const seen = new Set(farms.map(f => f.name.toLowerCase()));
+    for (const f of fb) if (!seen.has(f.name.toLowerCase())) farms.push(f);
+    usedRadius = 150;
+  }
+
+  renderFarms(farms, lat, lon, usedRadius);
+  hideLoader();
+}
+
+function pickFallback(lat, lon, maxKm) {
+  if (typeof FALLBACK_FARMS === 'undefined') return [];
+  return FALLBACK_FARMS
+    .map(f => ({ ...f, id: 'fb/' + f.name, distKm: distanceKm(lat, lon, f.lat, f.lon) }))
+    .filter(f => f.distKm <= maxKm);
 }
 
 async function reverseGeocode(lat, lon) {
+  const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10`, {
+    headers: { 'Accept': 'application/json' }
+  });
+  const data = await res.json();
+  const a = data.address || {};
+  const city = a.city || a.town || a.village || a.hamlet || a.county || '';
+  const region = a.state || a.region || a.country || '';
+  return [city, region].filter(Boolean).join(', ') || data.display_name || `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+}
+
+// Compact Overpass query. Note: the important tag for named US farms is
+// landuse=farmland (fields with a name) plus shop=farm and place=farm.
+function buildQuery(lat, lon, radiusM) {
+  return `[out:json][timeout:20];
+(
+  nwr(around:${radiusM},${lat},${lon})["shop"="farm"];
+  nwr(around:${radiusM},${lat},${lon})["place"="farm"][name];
+  nwr(around:${radiusM},${lat},${lon})["tourism"="farm"];
+  nwr(around:${radiusM},${lat},${lon})["landuse"="farmland"][name];
+  nwr(around:${radiusM},${lat},${lon})["landuse"="orchard"][name];
+  nwr(around:${radiusM},${lat},${lon})["landuse"="vineyard"][name];
+  nwr(around:${radiusM},${lat},${lon})["shop"="greengrocer"]["organic"];
+);
+out center tags 150;`;
+}
+
+// Race endpoints. Any HTML response, non-200, or empty body counts as failure
+// so Promise.any doesn't resolve with junk.
+async function fetchFarms(lat, lon, radiusM) {
+  const q = buildQuery(lat, lon, radiusM);
+  const endpoints = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+    'https://overpass.osm.ch/api/interpreter'
+  ];
+
+  const attempts = endpoints.map(ep => tryEndpoint(ep, q));
+
+  const overallTimeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('all endpoints timed out')), 20000)
+  );
+
   try {
-    const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=10`);
-    const data = await res.json();
-    const a = data.address || {};
-    const city = a.city || a.town || a.village || a.hamlet || a.county || '';
-    const region = a.state || a.region || a.country || '';
-    return [city, region].filter(Boolean).join(', ') || data.display_name || `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+    const elements = await Promise.race([Promise.any(attempts), overallTimeout]);
+    return elements.map(normalizeFarm).filter(Boolean);
   } catch {
-    return `${lat.toFixed(2)}, ${lon.toFixed(2)}`;
+    return [];
   }
 }
 
-// Overpass query — farms tagged in OpenStreetMap within ~40km.
-async function fetchFarms(lat, lon) {
-  const radiusM = 40000;
-  const q = `[out:json][timeout:20];(node(around:${radiusM},${lat},${lon})["shop"="farm"];way(around:${radiusM},${lat},${lon})["shop"="farm"];node(around:${radiusM},${lat},${lon})["place"="farm"]["name"];way(around:${radiusM},${lat},${lon})["place"="farm"]["name"];node(around:${radiusM},${lat},${lon})["landuse"="farmyard"]["name"];way(around:${radiusM},${lat},${lon})["landuse"="farmyard"]["name"];node(around:${radiusM},${lat},${lon})["tourism"="farm"];way(around:${radiusM},${lat},${lon})["tourism"="farm"];node(around:${radiusM},${lat},${lon})["shop"="greengrocer"]["organic"];);out center tags 80;`;
-  const endpoints = [
-    'https://overpass-api.de/api/interpreter',
-    'https://overpass.kumi.systems/api/interpreter',
-    'https://overpass.osm.ch/api/interpreter',
-    'https://overpass.private.coffee/api/interpreter'
-  ];
-  for (const ep of endpoints) {
-    try {
-      const res = await fetch(ep, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'data=' + encodeURIComponent(q),
-        signal: AbortSignal.timeout(22000)
-      });
-      if (!res.ok) continue;
-      const text = await res.text();
-      if (!text || text.trim().startsWith('<')) continue;
-      let data; try { data = JSON.parse(text); } catch { continue; }
-      if (!data.elements) continue;
-      return data.elements.map(normalizeFarm).filter(Boolean);
-    } catch {}
+async function tryEndpoint(ep, q) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 18000);
+  try {
+    const r = await fetch(ep, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json' },
+      body: 'data=' + encodeURIComponent(q),
+      signal: controller.signal
+    });
+    if (!r.ok) throw new Error(ep + ' ' + r.status);
+    const text = await r.text();
+    const trimmed = text.trim();
+    if (!trimmed || trimmed[0] === '<') throw new Error(ep + ' html');
+    const data = JSON.parse(trimmed);
+    if (!Array.isArray(data.elements)) throw new Error(ep + ' shape');
+    return data.elements;
+  } finally {
+    clearTimeout(t);
   }
-  return [];
 }
 
 function normalizeFarm(el) {
   const t = el.tags || {};
   if (!t.name) return null;
-  const lat = el.lat || (el.center && el.center.lat);
-  const lon = el.lon || (el.center && el.center.lon);
+  const lat = el.lat != null ? el.lat : (el.center && el.center.lat);
+  const lon = el.lon != null ? el.lon : (el.center && el.center.lon);
   if (lat == null || lon == null) return null;
+  // Filter greengrocers to organic-tagged ones so the list stays on-mission.
+  if (t.shop === 'greengrocer' && !(t.organic === 'yes' || t.organic === 'only')) return null;
   return {
     id: el.type + '/' + el.id,
     name: t.name,
@@ -154,7 +212,6 @@ function normalizeFarm(el) {
   };
 }
 
-// haversine, km
 function distanceKm(lat1, lon1, lat2, lon2) {
   const R = 6371;
   const dLat = (lat2 - lat1) * Math.PI / 180;
@@ -165,7 +222,7 @@ function distanceKm(lat1, lon1, lat2, lon2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
 }
 
-function renderPlace(label, lat) {
+function renderPlace(label) {
   placeName.textContent = label;
 }
 
@@ -177,33 +234,38 @@ function renderSeason(lat) {
   seasonList.innerHTML = list.map(item => `<li>${item}</li>`).join('');
 }
 
-function renderFarms(farms, lat, lon) {
-  // annotate distance, sort, cap
+function renderFarms(farms, lat, lon, radiusKm) {
   const withDist = farms.map(f => ({
     ...f,
-    distKm: distanceKm(lat, lon, f.lat, f.lon)
-  })).sort((a,b) => a.distKm - b.distKm).slice(0, 40);
+    distKm: f.distKm != null ? f.distKm : distanceKm(lat, lon, f.lat, f.lon)
+  })).filter(f => f.distKm <= radiusKm)
+    .sort((a, b) => a.distKm - b.distKm)
+    .slice(0, 40);
 
   farmCount.textContent = withDist.length
-    ? `${withDist.length} within 40 km`
+    ? `${withDist.length} within ${radiusKm} km`
     : '';
 
-  farmEmpty.hidden = withDist.length > 0;
+  if (!withDist.length) {
+    farmEmpty.hidden = false;
+    farmEmpty.textContent = `No farms found within ${radiusKm} km. Try entering a different place.`;
+    farmList.innerHTML = '';
+    return;
+  }
 
-  farmList.innerHTML = withDist.map(f => renderFarmItem(f, lat, lon)).join('');
+  farmEmpty.hidden = true;
+  farmList.innerHTML = withDist.map(f => renderFarmItem(f)).join('');
 }
 
-function renderFarmItem(f, myLat, myLon) {
+function renderFarmItem(f) {
   const t = f.tags;
   const dist = f.distKm < 1
     ? `${Math.round(f.distKm * 1000)} m`
     : `${f.distKm.toFixed(1)} km`;
 
-  // Access / channel tags
   const tags = [];
   if (t.organic === 'yes' || t.organic === 'only') tags.push({ label: 'Organic', solid: true });
   if (t.produce) {
-    // occasionally a list; keep short
     const first = String(t.produce).split(';')[0].split(',')[0].trim();
     if (first && first.length < 24) tags.push({ label: first });
   }
@@ -214,25 +276,23 @@ function renderFarmItem(f, myLat, myLon) {
   if (t.csa === 'yes' || t['farm:csa'] === 'yes' || /csa/i.test(t.name)) tags.push({ label: 'CSA' });
   if (t.tourism === 'farm' || t.agrotourism === 'yes') tags.push({ label: 'Visit' });
 
-  // Contact / address bits
   const metaBits = [];
   const addr = [t['addr:housenumber'], t['addr:street']].filter(Boolean).join(' ');
   const cityLine = [addr, t['addr:city']].filter(Boolean).join(', ');
-  if (cityLine) metaBits.push(cityLine);
+  if (cityLine) metaBits.push(escapeText(cityLine));
 
   const phone = t.phone || t['contact:phone'];
-  if (phone) metaBits.push(`<a href="tel:${phone.replace(/\s+/g,'')}">${phone}</a>`);
+  if (phone) metaBits.push(`<a href="tel:${phone.replace(/\s+/g,'')}">${escapeText(phone)}</a>`);
 
   const website = t.website || t['contact:website'] || t.url;
   if (website) {
     let host = website;
     try { host = new URL(website).hostname.replace(/^www\./,''); } catch {}
-    metaBits.push(`<a href="${escapeAttr(website)}" target="_blank" rel="noopener">${host}</a>`);
+    metaBits.push(`<a href="${escapeAttr(website)}" target="_blank" rel="noopener">${escapeText(host)}</a>`);
   }
   const opening = t.opening_hours;
   if (opening && opening.length < 40) metaBits.push(escapeText(opening));
 
-  // Actions
   const mapsHref = `https://www.openstreetmap.org/?mlat=${f.lat}&mlon=${f.lon}#map=17/${f.lat}/${f.lon}`;
   const dirHref = `https://www.google.com/maps/dir/?api=1&destination=${f.lat},${f.lon}`;
 
@@ -254,7 +314,7 @@ function renderFarmItem(f, myLat, myLon) {
 
 function escapeText(s) {
   return String(s).replace(/[&<>"']/g, c => ({
-    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
   }[c]));
 }
 function escapeAttr(s){ return escapeText(s); }
